@@ -167,13 +167,15 @@ object Completion {
           val grouped = elems.groupBy(f)
           keys.map(key => key -> grouped(key))
 
-      val grouped = ctx.outersIterator.toList.reverse.orderedGroupBy(_.owner).filter(_._1.exists)
-      val imported = grouped.map { (owner, contexts) =>
+      val contextsByOwner = ctx.outersIterator.toList
+        .reverse.orderedGroupBy(_.owner)
+        .filter(_._1.exists)
+      val imported = contextsByOwner.map { (_, contexts) =>
         contexts.collect { case context if context.isImportContext =>
           importedCompletions(using context)
         }.foldLeft(CompletionScope.empty)(_.mergeDiscardingAmbiguities(_))
       }
-      val members = grouped.map { (owner, _) =>
+      val members = contextsByOwner.map { (owner, _) =>
         if owner.isClass then
           CompletionScope.from(accessibleMembers(owner.thisType))
         else CompletionScope.empty
@@ -209,7 +211,10 @@ object Completion {
           val types = imp.site.member(name.toTypeName).alternatives.map(denot => nameInScope.toTypeName -> denot)
           CompletionScope.fromNamed(terms ++ types)
 
-        val givenImports = CompletionScope.fromNamed(imp.importedImplicits.map(x => (x.implicitName, x.underlyingRef.denot.asSingleDenotation)))
+        val namedImportedImplicits = imp.importedImplicits.map { ref =>
+          (ref.implicitName, ref.underlyingRef.denot.asSingleDenotation)
+        }
+        val givenImports = CompletionScope.fromNamed(namedImportedImplicits)
 
         val wildcardMembers =
           if imp.selectors.exists(_.imported.name == nme.WILDCARD) then
@@ -243,8 +248,8 @@ object Completion {
         case _: MethodOrPoly => tpe
         case _ => ExprType(tpe)
 
-      def tryApplyingReceiver(termRef: TermRef): Option[SingleDenotation] =
-        ctx.typer.tryApplyingReceiver(termRef, qual)
+      def tryApplyingReceiverToExtension(termRef: TermRef): Option[SingleDenotation] =
+        ctx.typer.tryApplyingExtensionMethod(termRef, qual)
           .map { tree =>
             val tpe = asDefLikeType(tree.tpe.dealias)
             termRef.denot.asSingleDenotation.mapInfo(_ => tpe)
@@ -259,7 +264,7 @@ object Completion {
               case name: TermName if name.startsWith(matchingNamePrefix) => Some((denot, name))
               case _ => None
 
-        types.flatMap{ tpe =>
+        types.flatMap { tpe =>
           tpe.membersBasedOnFlags(required = ExtensionMethod, excluded = EmptyFlags)
             .collect { case DenotWithMatchingName(denot, name) => TermRef(tpe, denot.symbol) -> name }
         }
@@ -287,8 +292,8 @@ object Completion {
       val extMethodsWithAppliedReceiver = availableExtMethods.flatMap {
         case (termRef, termName) =>
           if termRef.symbol.is(ExtensionMethod) && !qual.tpe.isBottomType then
-            val applied = tryApplyingReceiver(termRef)
-            applied.map{ denot =>
+            val applied = tryApplyingReceiverToExtension(termRef)
+            applied.map { denot =>
               val sym = denot.symbol.asTerm.copy(name = termName)
               denot.derivedSingleDenotation(sym, denot.info)
             }
@@ -367,27 +372,53 @@ object Completion {
       def isStable = true
     }
 
-    extension (scope: CompletionScope)
-      private def withDenots(denotations: Seq[SingleDenotation], name: Name)(using Context): CompletionScope = {
-        val denots = denotations.filter(denot => include(denot.symbol, name))
-        val shortName = name.stripModuleClassSuffix
-
-        if denots.nonEmpty then
-          CompletionScope(scope.nameToDenots + (shortName -> denots.toList))
-        else
-          scope
-      }
-
-    extension (scope: CompletionScope.type)
-      private def from(denots: Seq[SingleDenotation])(using Context): CompletionScope = {
-        val mappings = denots.filter(den => include(den.symbol, den.name)).toList.groupBy(_.name).map( (name, denots) => name.stripModuleClassSuffix -> denots)
+    object CompletionScope {
+      def from(denotations: Seq[SingleDenotation])(using Context): CompletionScope = {
+        val mappings = denotations
+          .filter(den => include(den.symbol, den.name))
+          .toList
+          .groupBy(_.name)
+          .map((name, denots) => name.stripModuleClassSuffix -> denots)
         CompletionScope(mappings)
       }
 
-      private def fromNamed(namedDenots: Seq[(Name, SingleDenotation)])(using Context): CompletionScope = {
-        val mappings = namedDenots.filter((name, den) => include(den.symbol, name)).toList.groupBy(_._1).map( (name, namedDens) => name.stripModuleClassSuffix -> namedDens.map(_._2))
+      def fromNamed(namedDenotations: Seq[(Name, SingleDenotation)])(using Context): CompletionScope = {
+        val mappings = namedDenotations
+          .filter((name, denot) => include(denot.symbol, name))
+          .toList
+          .groupBy(_._1)
+          .map((name, namedDenots) => name.stripModuleClassSuffix -> namedDenots.map(_._2))
         CompletionScope(mappings)
       }
+
+      val empty = CompletionScope()
+    }
+
+    class CompletionScope(nameToDenots: Map[Name, List[SingleDenotation]] = Map.empty) {
+      def mergeShadowedBy(that: CompletionScope) = CompletionScope(this.nameToDenots ++ that.nameToDenots)
+
+      def mergeDiscardingAmbiguities(that: CompletionScope) =
+        val mappings = (this.nameToDenots.toList ++ that.nameToDenots.toList)
+          .groupBy(_._1)
+          .collect {
+            case (name, (_, denots) :: Nil)  => name -> denots
+          }
+        CompletionScope(mappings)
+
+      /**
+       * Return the list of symbols that should be included in completion results.
+       *
+       * If several symbols share the same name, the type symbols appear before term symbols inside
+       * the same `Completion`.
+       */
+      def getCompletions(using Context): List[Completion] = {
+        nameToDenots.toList.groupBy(_._1.toTermName.show).map { (name, namedDenots) =>
+          val typesFirst = namedDenots.flatMap(_._2).sortWith((s1, s2) => s1.isType && !s2.isType)
+          val desc = description(typesFirst)
+          Completion(name, desc, typesFirst.map(_.symbol))
+        }.toList
+      }
+    }
   }
 
   /**
@@ -410,36 +441,6 @@ object Completion {
 
     /** Both term and type symbols are allowed */
     val Import: Mode = new Mode(4) | Term | Type
-  }
-
-  private object CompletionScope  {
-    val empty = CompletionScope()
-  }
-
-  private case class CompletionScope(nameToDenots: Map[Name, List[SingleDenotation]] = Map.empty) {
-    def mergeShadowedBy(that: CompletionScope) = CompletionScope(this.nameToDenots ++ that.nameToDenots)
-
-    def mergeDiscardingAmbiguities(that: CompletionScope) =
-      val mappings = (this.nameToDenots.toList ++ that.nameToDenots.toList)
-        .groupBy(_._1)
-        .collect {
-          case (name, (_, denots) :: Nil)  => name -> denots
-        }
-      CompletionScope(mappings)
-
-    /**
-     * Return the list of symbols that should be included in completion results.
-     *
-     * If several symbols share the same name, the type symbols appear before term symbols inside
-     * the same `Completion`.
-     */
-    def getCompletions(using Context): List[Completion] = {
-      nameToDenots.toList.groupBy(_._1.toTermName.show).map { (name, namedDenots) =>
-        val typesFirst = namedDenots.flatMap(_._2).sortWith((s1, s2) => s1.isType && !s2.isType)
-        val desc = description(typesFirst)
-        Completion(name, desc, typesFirst.map(_.symbol))
-      }.toList
-    }
   }
 }
 
